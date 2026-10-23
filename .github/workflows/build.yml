@@ -1,0 +1,415 @@
+# Deviserver · constructor de apps Flutter (repositorio PUBLICO "deviserver-builder").
+# Lo dispara el servidor por la API (workflow_dispatch) con dos entradas: repo_url y job_id.
+#
+# Modelo de seguridad (defensa en profundidad):
+#   * Job "compilar"  = el UNICO que toca codigo NO confiable (el repositorio del usuario). No tiene secretos, su GITHUB_TOKEN
+#                       no tiene ningun permiso (permissions: {}), no usa cache y no lleva credenciales: solo clona repos publicos.
+#   * Job "certificar" = NO ejecuta nada del repositorio del usuario. Baja lo que produjo "compilar", lo revisa con las mismas
+#                       reglas del servidor, recalcula el SHA-256 y publica el artefacto FINAL "dvs-<job_id>", que es el unico
+#                       que el servidor descarga (el servidor ademas compara el digest que GitHub calculo de ese zip).
+#   * Las acciones estan fijadas por SHA de commit completo (el comentario indica la version).
+#   * Las entradas jamas se escriben dentro de un "run:": llegan por "env:" y se validan en el primer paso.
+name: Compilar app Flutter (Deviserver)
+run-name: dvs ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: "Repositorio PUBLICO de GitHub: https://github.com/<dueño>/<repo>"
+        required: true
+        type: string
+      job_id:
+        description: "Identificador del trabajo (32 caracteres hexadecimales)"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: dvs-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------------------------------------------
+  compilar:
+    name: Compilar (codigo NO confiable)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions: {}
+    steps:
+      - name: Validar entradas
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          fallo() { echo "::error::$1"; exit 1; }
+          re_url='^https://github\.com/([A-Za-z0-9_.-]{1,39})/([A-Za-z0-9_.-]{1,100})$'
+          [[ "$REPO_URL" =~ $re_url ]] || fallo "La URL del repositorio no es valida (solo https://github.com/<dueño>/<repo>)."
+          dueno="${BASH_REMATCH[1]}"
+          repo="${BASH_REMATCH[2]%.git}"
+          for x in "$dueno" "$repo"; do
+            [[ -n "$x" && "$x" != "." && "$x" != ".." ]] || fallo "Nombre de repositorio no valido."
+          done
+          [[ "$JOB_ID" =~ ^[0-9a-f]{32}$ ]] || fallo "El identificador del trabajo no es valido."
+          # Solo repositorios PUBLICOS: aqui no hay credenciales, asi que uno privado simplemente no se puede leer.
+          export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+          timeout 60 git ls-remote --exit-code -- "https://github.com/$dueno/$repo.git" HEAD >/dev/null 2>&1 \
+            || fallo "No se pudo leer el repositorio. Debe ser publico."
+          mkdir -p "$RUNNER_TEMP/dvs"
+          printf '%s\n' "https://github.com/$dueno/$repo.git" > "$RUNNER_TEMP/dvs/url"
+
+      - name: "Instalar Flutter (sin cache, que lo podria envenenar un repositorio ajeno)"
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          cache: false
+
+      - name: Clonar el repositorio (superficial, sin hooks, sin enlaces simbolicos, sin LFS)
+        run: |
+          export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_LFS_SKIP_SMUDGE=1
+          URL="$(cat "$RUNNER_TEMP/dvs/url")"
+          mkdir -p "$RUNNER_TEMP/w"
+          cd "$RUNNER_TEMP/w"
+          timeout 180 git -c core.symlinks=false -c core.hooksPath=/dev/null -c protocol.allow=never -c protocol.https.allow=always \
+            -c filter.lfs.smudge= -c filter.lfs.process= -c filter.lfs.required=false \
+            clone --depth 1 --single-branch --no-tags --no-recurse-submodules --quiet -- "$URL" src
+          rm -rf src/.git
+          find src -type l -delete
+          bytes="$(du -sb src | cut -f1)"
+          [ "$bytes" -le 524288000 ] || { echo "::error::El repositorio es demasiado grande (maximo 500 MB)."; exit 1; }
+
+      - name: Detectar la app Flutter (mismo criterio que lib/flutter.php del servidor)
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+          T = os.environ['RUNNER_TEMP']
+          RAIZ = os.path.join(T, 'w', 'src')
+          OMITIR = {'node_modules', 'build', 'web_build', 'ios', 'android', 'macos', 'windows', 'linux', 'Pods'}
+          PROFUNDIDAD, MAX_ENTRADAS = 4, 20000
+          RX = re.compile(r'^[ \t]+sdk:[ \t]*["\']?flutter["\']?[ \t]*(#.*)?$', re.M)
+
+          def es_flutter(f):
+              if os.path.islink(f) or not os.path.isfile(f):
+                  return False
+              with open(f, 'rb') as h:
+                  return bool(RX.search(h.read(65536).decode('utf-8', 'replace')))
+
+          apps, cola, vistos = [], [('', 0)], 0
+          while cola:
+              rel, nivel = cola.pop(0)
+              d = RAIZ if rel == '' else os.path.join(RAIZ, rel)
+              if es_flutter(os.path.join(d, 'pubspec.yaml')):
+                  apps.append(rel)
+              if nivel >= PROFUNDIDAD:
+                  continue
+              try:
+                  nombres = sorted(os.listdir(d))
+              except OSError:
+                  continue
+              tope = False
+              for n in nombres:
+                  if n.startswith('.'):
+                      continue
+                  vistos += 1
+                  if vistos > MAX_ENTRADAS:
+                      tope = True
+                      break
+                  if n in OMITIR or any(ord(c) < 32 for c in n):
+                      continue
+                  sub = os.path.join(d, n)
+                  if os.path.islink(sub) or not os.path.isdir(sub):
+                      continue
+                  cola.append((n if rel == '' else rel + '/' + n, nivel + 1))
+              if tope:
+                  break
+
+          def manifiesto():
+              f = os.path.join(RAIZ, 'deviserver.json')
+              if os.path.islink(f) or not os.path.isfile(f) or os.path.getsize(f) > 4096:
+                  return None
+              try:
+                  with open(f, encoding='utf-8') as h:
+                      j = json.load(h)
+              except Exception:
+                  return None
+              w = j.get('web') if isinstance(j, dict) else None
+              if not isinstance(w, str):
+                  return None
+              w = w.strip('/')
+              if len(w) > 200 or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_./-]*', w):
+                  return None
+              if any(p in ('', '.', '..') or p.startswith('.') for p in w.split('/')):
+                  return None
+              return w
+
+          def tiene_web(a):
+              d = RAIZ if a == '' else os.path.join(RAIZ, a)
+              w = os.path.join(d, 'web')
+              i = os.path.join(w, 'index.html')
+              return os.path.isdir(w) and not os.path.islink(w) and os.path.isfile(i) and not os.path.islink(i)
+
+          if not apps:
+              print('::error::No encontre ninguna app Flutter (un pubspec.yaml con "sdk: flutter") en el repositorio.')
+              sys.exit(1)
+          con_web = [a for a in apps if tiene_web(a)]
+          if not con_web:
+              print('::error::Hay una app Flutter pero no tiene carpeta web/. Agregale soporte web con: flutter create . --platforms web')
+              sys.exit(1)
+          elegida = None
+          man = manifiesto()
+          if man is not None:       # eleccion explicita del dueño del repo: gana la app que contiene esa ruta
+              dentro = [a for a in con_web if a != '' and (man == a or man.startswith(a + '/'))]
+              if dentro:
+                  elegida = max(dentro, key=len)
+          if elegida is None and '' in con_web:      # la app de la raiz
+              elegida = ''
+          if elegida is None:                          # la primera (la mas cercana a la raiz) con carpeta web/
+              elegida = con_web[0]
+          print('Apps Flutter encontradas: %d. Se compila: %s' % (len(apps), elegida or '(raiz del repositorio)'))
+          with open(os.path.join(T, 'dvs', 'app_dir'), 'w', encoding='utf-8') as h:
+              h.write((elegida or '.') + '\n')
+          PY
+
+      - name: Compilar para web
+        env:
+          CI: "true"
+          FLUTTER_SUPPRESS_ANALYTICS: "true"
+        run: |
+          APP="$(cat "$RUNNER_TEMP/dvs/app_dir")"
+          cd "$RUNNER_TEMP/w/src/$APP"
+          flutter --version
+          flutter pub get
+          flutter build web --release --base-href /
+
+      - name: Empaquetar (sin mapas, sin ocultos, sin enlaces, con limites) y calcular SHA-256
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, shutil, sys, tarfile, unicodedata
+          T = os.environ['RUNNER_TEMP']
+          with open(os.path.join(T, 'dvs', 'app_dir'), encoding='utf-8') as h:
+              app = h.read().strip()
+          origen = os.path.join(T, 'w', 'src', app, 'build', 'web')
+          destino = os.path.join(T, 'web')
+          salida = os.path.join(T, 'pack')
+          MAX_BYTES, MAX_ARCHIVOS, MAX_PROF, MAX_RUTA, MAX_SEG = 60 * 1024 * 1024, 5000, 10, 200, 100
+          PROHIBIDAS = {'php', 'php3', 'php4', 'php5', 'php7', 'php8', 'phtml', 'phar', 'phps', 'cgi', 'pl', 'py', 'sh', 'bash', 'rb',
+                        'asp', 'aspx', 'jsp', 'jspx', 'shtml', 'htaccess', 'htpasswd', 'ini', 'env', 'conf', 'pht', 'phtm'}
+          MARCAS = ('main.dart.js', 'flutter_bootstrap.js', 'flutter.js', 'main.dart.mjs')
+
+          def fallo(msg):
+              print('::error::' + msg)
+              sys.exit(1)
+
+          def prohibido(seg):
+              s = seg.lower()
+              return s == 'web.config' or any(p in PROHIBIDAS for p in s.split('.')[1:])
+
+          # MISMA regla que dvs_comp_segmento_enganoso() de lib/compilador.php: control/formato Unicode (Cc, Cf), CUALQUIER espacio
+          # (Zs, Zl, Zp), uso privado, punto final, puntos de ancho completo y nombres que no estan en forma NFC.
+          CATS_MALAS = {'Cc', 'Cf', 'Zs', 'Zl', 'Zp', 'Co', 'Cs'}
+          PUNTOS_RAROS = {'\uff0e', '\uff61', '\u3002', '\u2024', '\ufe52'}
+
+          def enganoso(seg):
+              if seg.endswith('.') or unicodedata.normalize('NFC', seg) != seg:
+                  return True
+              return any(unicodedata.category(c) in CATS_MALAS or c in PUNTOS_RAROS for c in seg)
+
+          if not os.path.isdir(origen) or os.path.islink(origen):
+              fallo('flutter build web no genero build/web.')
+          for r, ds, fs in os.walk(origen):                 # enlaces fuera ANTES de copiar
+              for n in ds + fs:
+                  p = os.path.join(r, n)
+                  if os.path.islink(p):
+                      os.unlink(p)
+          shutil.rmtree(destino, ignore_errors=True)
+          shutil.copytree(origen, destino, symlinks=True)
+          quitados = 0
+          for r, ds, fs in os.walk(destino, topdown=False):
+              for n in fs + ds:
+                  p = os.path.join(r, n)
+                  if os.path.islink(p) or (not os.path.isdir(p) and not os.path.isfile(p)):
+                      os.unlink(p); quitados += 1
+                  elif n.startswith('.') or prohibido(n) or (os.path.isfile(p) and n.lower().endswith('.map')):
+                      if os.path.isdir(p):
+                          shutil.rmtree(p)
+                      else:
+                          os.unlink(p)
+                      quitados += 1
+          archivos, total, dirs = [], 0, 0
+          for r, ds, fs in os.walk(destino):
+              dirs += len(ds)
+              for n in fs:
+                  p = os.path.join(r, n)
+                  rel = os.path.relpath(p, destino).replace(os.sep, '/')
+                  segs = rel.split('/')
+                  try:
+                      rel.encode('utf-8')
+                  except UnicodeEncodeError:
+                      fallo('Hay un archivo con un nombre que no es UTF-8 valido.')
+                  if (len(rel) > MAX_RUTA or len(segs) > MAX_PROF or any(len(s) > MAX_SEG for s in segs)
+                          or any(ord(c) < 32 or ord(c) == 127 or c in '\\:' for c in rel) or any(enganoso(s) for s in segs)):
+                      fallo('Hay un archivo con ruta demasiado larga o con caracteres no permitidos.')
+                  total += os.path.getsize(p)
+                  archivos.append((rel, p))
+          if len(archivos) + dirs > MAX_ARCHIVOS:
+              fallo('El build tiene demasiados archivos (maximo %d).' % MAX_ARCHIVOS)
+          if total > MAX_BYTES:
+              fallo('El build pesa %d MB y el maximo es 60 MB.' % (total // 1048576))
+          if not os.path.isfile(os.path.join(destino, 'index.html')) or not any(os.path.isfile(os.path.join(destino, m)) for m in MARCAS):
+              fallo('El resultado no parece un build web de Flutter (falta index.html o los archivos de Flutter).')
+          os.makedirs(salida, exist_ok=True)
+          tgz = os.path.join(salida, 'build.tgz')
+          try:
+              with tarfile.open(tgz, 'w:gz', format=tarfile.USTAR_FORMAT, compresslevel=9) as t:
+                  for rel, p in sorted(archivos):
+                      ti = tarfile.TarInfo(rel)
+                      ti.size, ti.mode, ti.mtime, ti.uid, ti.gid, ti.uname, ti.gname = os.path.getsize(p), 0o644, 0, 0, 0, '', ''
+                      with open(p, 'rb') as f:
+                          t.addfile(ti, f)
+          except ValueError:
+              fallo('Un nombre de archivo es demasiado largo para empaquetarlo.')
+          if os.path.getsize(tgz) > 60 * 1024 * 1024:
+              fallo('El paquete comprimido supera 60 MB.')
+          h = hashlib.sha256()
+          with open(tgz, 'rb') as f:
+              for b in iter(lambda: f.read(1048576), b''):
+                  h.update(b)
+          with open(os.path.join(salida, 'build.tgz.sha256'), 'w', encoding='utf-8') as f:
+              f.write('%s  build.tgz\n' % h.hexdigest())
+          print('Archivos: %d, bytes: %d, quitados (ocultos/mapas/enlaces/servidor): %d' % (len(archivos), total, quitados))
+          print('sha256 ' + h.hexdigest())
+          PY
+
+      - name: Subir resultado crudo (lo revisa el job siguiente; el servidor NO lo descarga)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: raw-${{ inputs.job_id }}
+          path: |
+            ${{ runner.temp }}/pack/build.tgz
+            ${{ runner.temp }}/pack/build.tgz.sha256
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
+          include-hidden-files: false
+
+  # ---------------------------------------------------------------------------------------------------------------
+  certificar:
+    name: Certificar (no ejecuta codigo del repositorio)
+    needs: compilar
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Validar entradas
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          [[ "$JOB_ID" =~ ^[0-9a-f]{32}$ ]] || { echo "::error::Identificador no valido."; exit 1; }
+
+      - name: Descargar el resultado crudo
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: raw-${{ inputs.job_id }}
+          path: ${{ runner.temp }}/raw
+
+      - name: Revisar el paquete (mismas reglas que el servidor) y recalcular el SHA-256
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, re, shutil, sys, tarfile, unicodedata
+          T = os.environ['RUNNER_TEMP']
+          raw, final = os.path.join(T, 'raw'), os.path.join(T, 'final')
+          MAX_BYTES, MAX_ARCHIVOS, MAX_PROF, MAX_RUTA, MAX_SEG = 60 * 1024 * 1024, 5000, 10, 200, 100
+          PROHIBIDAS = {'php', 'php3', 'php4', 'php5', 'php7', 'php8', 'phtml', 'phar', 'phps', 'cgi', 'pl', 'py', 'sh', 'bash', 'rb',
+                        'asp', 'aspx', 'jsp', 'jspx', 'shtml', 'htaccess', 'htpasswd', 'ini', 'env', 'conf', 'pht', 'phtm'}
+          MARCAS = ('main.dart.js', 'flutter_bootstrap.js', 'flutter.js', 'main.dart.mjs')
+
+          def fallo(msg):
+              print('::error::' + msg)
+              sys.exit(1)
+
+          def prohibido(seg):
+              s = seg.lower()
+              return s == 'web.config' or any(p in PROHIBIDAS for p in s.split('.')[1:])
+
+          # MISMA regla que dvs_comp_segmento_enganoso() de lib/compilador.php: control/formato Unicode (Cc, Cf), CUALQUIER espacio
+          # (Zs, Zl, Zp), uso privado, punto final, puntos de ancho completo y nombres que no estan en forma NFC.
+          CATS_MALAS = {'Cc', 'Cf', 'Zs', 'Zl', 'Zp', 'Co', 'Cs'}
+          PUNTOS_RAROS = {'\uff0e', '\uff61', '\u3002', '\u2024', '\ufe52'}
+
+          def enganoso(seg):
+              if seg.endswith('.') or unicodedata.normalize('NFC', seg) != seg:
+                  return True
+              return any(unicodedata.category(c) in CATS_MALAS or c in PUNTOS_RAROS for c in seg)
+
+          if sorted(os.listdir(raw)) != ['build.tgz', 'build.tgz.sha256']:
+              fallo('El resultado crudo trae archivos inesperados.')
+          tgz, shaf = os.path.join(raw, 'build.tgz'), os.path.join(raw, 'build.tgz.sha256')
+          for p in (tgz, shaf):
+              if os.path.islink(p) or not os.path.isfile(p):
+                  fallo('El resultado crudo no es un archivo normal.')
+          if os.path.getsize(tgz) > 60 * 1024 * 1024 or os.path.getsize(shaf) > 256:
+              fallo('El resultado crudo supera los limites.')
+          h = hashlib.sha256()
+          with open(tgz, 'rb') as f:
+              for b in iter(lambda: f.read(1048576), b''):
+                  h.update(b)
+          with open(shaf, encoding='utf-8') as f:
+              m = re.fullmatch(r'([0-9a-f]{64})  build\.tgz\n?', f.read())
+          if not m or m.group(1) != h.hexdigest():
+              fallo('El SHA-256 declarado no coincide con el paquete.')
+          total, n, vistos, hay_index, hay_marca = 0, 0, set(), False, False
+          with tarfile.open(tgz, 'r:gz') as t:
+              for mi in t:                                  # solo se lee la lista: nada se extrae
+                  n += 1
+                  if n > MAX_ARCHIVOS:
+                      fallo('Demasiados archivos.')
+                  if not (mi.isreg() or mi.isdir()) or mi.islnk() or mi.issym():
+                      fallo('El paquete trae enlaces o archivos especiales.')
+                  ruta = mi.name.rstrip('/') if mi.isdir() else mi.name
+                  segs = ruta.split('/')
+                  if (not ruta or len(ruta) > MAX_RUTA or ruta.startswith('/') or len(segs) > MAX_PROF
+                          or any(s in ('', '.', '..') or s.startswith('.') or len(s) > MAX_SEG or prohibido(s) or enganoso(s) for s in segs)
+                          or any(ord(c) < 32 or ord(c) == 127 or c in '\\:' for c in ruta)):
+                      fallo('El paquete trae una ruta no permitida.')
+                  if ruta.lower() in vistos:
+                      fallo('El paquete trae entradas repetidas.')
+                  vistos.add(ruta.lower())
+                  if mi.isreg():
+                      total += mi.size
+                      if total > MAX_BYTES:
+                          fallo('El paquete supera los 60 MB descomprimidos.')
+                      hay_index = hay_index or ruta == 'index.html'
+                      hay_marca = hay_marca or ruta in MARCAS
+          if not (hay_index and hay_marca):
+              fallo('El paquete no parece un build web de Flutter.')
+          os.makedirs(final, exist_ok=True)
+          shutil.copyfile(tgz, os.path.join(final, 'build.tgz'))
+          shutil.copyfile(shaf, os.path.join(final, 'build.tgz.sha256'))
+          print('Paquete verificado: %d entradas, %d bytes, sha256 %s' % (n, total, h.hexdigest()))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as s:
+              s.write('### Resultado verificado\n\n- Entradas: %d\n- Bytes descomprimidos: %d\n- SHA-256 de build.tgz: `%s`\n' % (n, total, h.hexdigest()))
+          PY
+
+      - name: Publicar el artefacto FINAL (el unico que descarga el servidor)
+        id: subir
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dvs-${{ inputs.job_id }}
+          path: |
+            ${{ runner.temp }}/final/build.tgz
+            ${{ runner.temp }}/final/build.tgz.sha256
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 0
+          include-hidden-files: false
+
+      - name: Anotar el digest del artefacto en el resumen
+        env:
+          DIGEST: ${{ steps.subir.outputs.artifact-digest }}
+        run: |
+          printf -- '- Digest del artefacto (lo compara el servidor): `%s`\n' "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
