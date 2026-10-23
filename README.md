@@ -24,8 +24,9 @@ Este repositorio ejecuta, en los servidores de GitHub, **codigo que escriben ter
 2. **Crea el repositorio**: en GitHub, *New repository* -> nombre `deviserver-builder` -> **Public** -> sin README. Sube el contenido de esta carpeta
    (que quede `.github/workflows/build.yml` en la raiz del repositorio, rama `main`).
 3. **Ajusta Actions** del repositorio (*Settings -> Actions -> General*):
-   - *Actions permissions*: **Allow {tu usuario}, and select non-{tu usuario}, actions** y marca solo "Allow actions created by GitHub"
-     y escribe `subosito/flutter-action@*`.
+   - *Actions permissions*: **Allow {tu usuario}, and select non-{tu usuario}, actions**, marca solo "Allow actions created by GitHub",
+     deja vacia la lista de acciones extra y marca "Require actions to be pinned to a full-length commit SHA". El flujo no usa
+     ninguna accion de terceros: Flutter se baja del archivo oficial de Google y se verifica con su SHA-256.
    - *Workflow permissions*: **Read repository contents and packages permissions** (solo lectura).
    - *Fork pull request workflows*: deja todo en lo mas estricto ("Require approval for all outside collaborators").
 4. **Crea un token de acceso fino (fine-grained) SOLO para este repositorio**: *Settings (tu cuenta) -> Developer settings -> Personal access tokens ->
@@ -44,7 +45,8 @@ Este repositorio ejecuta, en los servidores de GitHub, **codigo que escriben ter
    EOT
    unset T
    ```
-   Opcional: `"cuota_diaria": 5` (compilaciones por usuario cada 24 h) y `"exigir_digest": true`.
+   Opcional: `"cuota_diaria": 5` (compilaciones por usuario cada 24 h), `"cuota_global_diaria": 25` (de todo el servidor cada 24 h)
+   y `"exigir_digest": true`.
 6. **Prueba**: en el panel de un usuario, pega `https://github.com/sluna5-coder/rick-morty.git` -> debe aparecer "Compilando en GitHub..." y a los
    3-6 minutos el boton **Abrir app**.
 
@@ -52,7 +54,8 @@ Este repositorio ejecuta, en los servidores de GitHub, **codigo que escriben ter
 
 - Dos jobs. `compilar` es el unico que toca codigo ajeno: sin secretos, sin permisos (`permissions: {}`), sin cache, sin credenciales (solo clona repos publicos),
   maximo 15 minutos. `certificar` no ejecuta nada del repositorio: revisa el paquete, recalcula el SHA-256 y publica el artefacto final `dvs-<id>`.
-- Las acciones estan fijadas por SHA de commit completo. Si GitHub publica versiones nuevas, actualiza el SHA a mano (con la version en el comentario).
+- Solo se usan acciones de GitHub (subir/bajar artefactos), fijadas por SHA de commit completo. Flutter se instala desde el archivo oficial
+  de Google (indice `releases_linux.json`, canal stable) y se comprueba su SHA-256 antes de usarlo.
 - La URL solo puede ser `https://github.com/<dueño>/<repo>` y el `job_id` 32 caracteres hexadecimales; se validan antes de hacer nada.
 - Se elige una sola app: la que indique `deviserver.json` (`{"web": "apps/x/web_build"}`), si no la de la raiz, si no la primera que tenga carpeta `web/`.
 - El resultado se limita a 60 MB / 5000 archivos y no puede contener enlaces simbolicos, archivos ocultos, mapas de codigo ni archivos de servidor (php, sh...).
