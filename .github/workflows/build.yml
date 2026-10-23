@@ -7,7 +7,8 @@
 #   * Job "certificar" = NO ejecuta nada del repositorio del usuario. Baja lo que produjo "compilar", lo revisa con las mismas
 #                       reglas del servidor, recalcula el SHA-256 y publica el artefacto FINAL "dvs-<job_id>", que es el unico
 #                       que el servidor descarga (el servidor ademas compara el digest que GitHub calculo de ese zip).
-#   * Las acciones estan fijadas por SHA de commit completo (el comentario indica la version).
+#   * Las acciones estan fijadas por SHA de commit completo (el comentario indica la version). Flutter NO se instala con una
+#     accion de terceros: se baja el archivo oficial de Google y se verifica su SHA-256 contra el indice oficial.
 #   * Las entradas jamas se escriben dentro de un "run:": llegan por "env:" y se validan en el primer paso.
 name: Compilar app Flutter (Deviserver)
 run-name: dvs ${{ inputs.job_id }}
@@ -63,11 +64,41 @@ jobs:
           mkdir -p "$RUNNER_TEMP/dvs"
           printf '%s\n' "https://github.com/$dueno/$repo.git" > "$RUNNER_TEMP/dvs/url"
 
-      - name: "Instalar Flutter (sin cache, que lo podria envenenar un repositorio ajeno)"
-        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
-        with:
-          channel: stable
-          cache: false
+      - name: Instalar Flutter (archivo oficial de Google verificado con SHA-256; sin cache ni acciones de terceros)
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, sys, urllib.request
+          T = os.environ['RUNNER_TEMP']
+          BASE = 'https://storage.googleapis.com/flutter_infra_release/releases'
+
+          def fallo(msg):
+              print('::error::' + msg)
+              sys.exit(1)
+
+          with urllib.request.urlopen(BASE + '/releases_linux.json', timeout=60) as r:
+              j = json.load(r)
+          h = j['current_release']['stable']
+          rel = next((x for x in j['releases'] if x.get('hash') == h and x.get('channel') == 'stable'), None)
+          if rel is None:
+              fallo('No encontre la version estable de Flutter.')
+          arch, sha = rel.get('archive', ''), rel.get('sha256', '')
+          if not re.fullmatch(r'stable/linux/flutter_linux_[0-9][0-9A-Za-z.+-]*-stable\.tar\.xz', arch) or not re.fullmatch(r'[0-9a-f]{64}', sha):
+              fallo('El indice de versiones de Flutter trae datos inesperados.')
+          s = hashlib.sha256()
+          with urllib.request.urlopen(BASE + '/' + arch, timeout=600) as r, open(os.path.join(T, 'flutter.tar.xz'), 'wb') as f:
+              for b in iter(lambda: r.read(1048576), b''):
+                  s.update(b)
+                  f.write(b)
+          if s.hexdigest() != sha:
+              fallo('El SHA-256 del archivo de Flutter no coincide.')
+          print('Flutter %s verificado, sha256 %s' % (rel.get('version'), sha))
+          PY
+          tar -xJf "$RUNNER_TEMP/flutter.tar.xz" -C "$RUNNER_TEMP"
+          rm -f "$RUNNER_TEMP/flutter.tar.xz"
+          git config --global --add safe.directory "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/flutter/bin/flutter" --disable-analytics >/dev/null 2>&1 || true
+          "$RUNNER_TEMP/flutter/bin/flutter" precache --web
 
       - name: Clonar el repositorio (superficial, sin hooks, sin enlaces simbolicos, sin LFS)
         run: |
